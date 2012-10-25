@@ -37,8 +37,7 @@ static ssize_t default_recv(const void *cookie,
                             size_t len)
 {
   struct msghdr msg;
-  struct iovec iov;
-  mm_segment_t oldfs;
+  struct kvec kv;
   int size = 0;
 
   (void)cookie;
@@ -46,23 +45,17 @@ static ssize_t default_recv(const void *cookie,
   /* if there is no backing sock... */
   if (sock->sk==NULL) return 0;
 
-  iov.iov_base = buf;
-  iov.iov_len = len;
+  kv.iov_base = buf;
+  kv.iov_len = len;
 
-  msg.msg_flags = MSG_DONTWAIT;
+  msg.msg_flags = 0;
   msg.msg_name = NULL;
   msg.msg_namelen = 0;
   msg.msg_control = NULL;
   msg.msg_controllen = 0;
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
   msg.msg_control = NULL;
 
-  oldfs = get_fs();
-  set_fs(KERNEL_DS);
-  size = sock_recvmsg(sock,&msg,len,msg.msg_flags);
-  set_fs(oldfs);
-
+  size = kernel_recvmsg(sock, &msg, &kv, 1, len, msg.msg_flags);
   return size;
 }
 
@@ -84,8 +77,7 @@ static ssize_t default_send(const void *cookie,
                             size_t len)
 {
   struct msghdr msg;
-  struct iovec iov;
-  mm_segment_t oldfs;
+  struct kvec kv;
   int size = 0;
 
   (void)cookie;
@@ -96,24 +88,18 @@ static ssize_t default_send(const void *cookie,
       return 0;
 
   /* Construct our scatter/gather list */
-  iov.iov_base = (void*)buf;
-  iov.iov_len = len;
+  kv.iov_base = (void*)buf;
+  kv.iov_len = len;
 
-  msg.msg_flags = MSG_DONTWAIT;
+  msg.msg_flags = MSG_WAITALL;
   msg.msg_name = NULL;
   msg.msg_namelen  = 0;
   msg.msg_control = NULL;
   msg.msg_controllen = 0;
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
 
   /* TODO: what does this do? */
   // http://mail.nl.linux.org/kernelnewbies/2005-12/msg00282.html
-  oldfs = get_fs();
-  set_fs(KERNEL_DS);
-  size = sock_sendmsg(sock,&msg,len);
-  set_fs(oldfs);
-
+  size = kernel_sendmsg(sock, &msg, &kv, 1, len);
   return size;
 }
 
@@ -349,81 +335,43 @@ void memcached_protocol_client_destroy(struct memcached_protocol_client_st *clie
 
 memcached_protocol_event_t memcached_protocol_client_work(struct memcached_protocol_client_st *client)
 {
-  /* Try to send data and read from the socket */
-  bool more_data= true;
-  memcached_protocol_event_t ret;
+    for (;;) {
+        void *endptr;
+        memcached_protocol_event_t events;
 
-  do
-  {
-    ssize_t len= client->root->recv(client,
-                                    client->sock,
-                                    client->root->input_buffer + client->input_buffer_offset,
-                                    client->root->input_buffer_size - client->input_buffer_offset);
+        ssize_t len= client->root->recv(client,
+                                        client->sock,
+                                        client->root->input_buffer + client->input_buffer_offset,
+                                        client->root->input_buffer_size - client->input_buffer_offset);
+        if (len == 0) return 0;
+        if (len <  0) return MEMCACHED_PROTOCOL_ERROR_EVENT;
 
-    if (len > 0)
-    {
-      void *endptr;
-      memcached_protocol_event_t events;
+        len += client->input_buffer_offset;
+        client->input_buffer_offset = len;
 
-      /* Do we have the complete packet? */
-      if (client->input_buffer_offset > 0)
-      {
-        memcpy(client->root->input_buffer, client->input_buffer,
-               client->input_buffer_offset);
-        len += (ssize_t)client->input_buffer_offset;
-
-        /* @todo use buffer-cache! */
-        kfree(client->input_buffer);
-        client->input_buffer_offset= 0;
-      }
-
-      events= client->work(client, &len, &endptr);
-      if (events == MEMCACHED_PROTOCOL_ERROR_EVENT)
-      {
-        return MEMCACHED_PROTOCOL_ERROR_EVENT;
-      }
-
-      if (len > 0)
-      {
-        /* save the data for later on */
-        /* @todo use buffer-cache */
-        client->input_buffer= kmalloc((size_t)len, GFP_KERNEL);
-        if (client->input_buffer == NULL)
-        {
-          client->error= ENOMEM;
-          return MEMCACHED_PROTOCOL_ERROR_EVENT;
+        events= client->work(client, &len, &endptr);
+        if (events == MEMCACHED_PROTOCOL_ERROR_EVENT) {
+            return MEMCACHED_PROTOCOL_ERROR_EVENT;
         }
-        memcpy(client->input_buffer, endptr, (size_t)len);
-        client->input_buffer_offset= (size_t)len;
-        more_data= false;
-      }
-    }
-    else if (len == 0)
-    {
-      break;
-    }
-    else
-    {
-      if (len != -EWOULDBLOCK)
-      {
-        printk(KERN_ERR "libmp: clien_work recv returned error %lu; assuming connection closed\n", -len);
-        client->error= -len;
-        /* mark this client as terminated! */
-        return MEMCACHED_PROTOCOL_ERROR_EVENT;
-      }
-      more_data= false;
-    }
-  } while (more_data);
 
-  if (!drain_output(client))
-  {
-    printk(KERN_INFO "libmp: clien_work error draining output\n");
-    return MEMCACHED_PROTOCOL_ERROR_EVENT;
-  }
-
-  ret = MEMCACHED_PROTOCOL_READ_EVENT;
-  if (client->output)
-    ret |= MEMCACHED_PROTOCOL_WRITE_EVENT;
-
-  return ret;
+        if (len > 0) {
+            /* save the data for later on */
+            /* @todo use buffer-cache */
+            client->input_buffer= kmalloc((size_t)len, GFP_KERNEL);
+            if (client->input_buffer == NULL)
+            {
+                client->error= ENOMEM;
+                return MEMCACHED_PROTOCOL_ERROR_EVENT;
+            }
+            memmove(client->input_buffer, endptr, (size_t)len);
+            client->input_buffer_offset = (size_t)len;
+        } else {
+            client->input_buffer_offset = 0;
+        }
+        if (!drain_output(client)) {
+            printk(KERN_INFO "libmp: clien_work error draining output\n");
+            return MEMCACHED_PROTOCOL_ERROR_EVENT;
+        }
+    }
+    return 0;
 }

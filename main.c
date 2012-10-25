@@ -110,6 +110,8 @@ typedef struct client_t{
      * workqueue when there is work to be done by this client. */
     struct work_struct work;
 
+    struct task_struct *task;
+
     /** For clients list. */
     struct list_head list;
 
@@ -124,6 +126,7 @@ typedef struct client_t{
 static LIST_HEAD(clients);
 
 static int listen_thread(void*);
+static int client_thread(void*);
 static void close_listen_socket(void);
 static void client_work(struct work_struct *work);
 static void close_connection(client_t *client);
@@ -141,56 +144,6 @@ struct socket *listen_socket;
 
 /** libmemcachedprotocol handle */
 struct memcached_protocol_st *protocol_handle;
-
-/** Equeue a client on the workqueue */
-static void queue_client(client_t *client){
-    queue_work(workqueue, &(client->work));
-}
-
-/** Callback for availability of write space on a socket. 
- *
- * TODO: Maybe, we should be using our own buffers and supplying them to the
- * socket.  I think the ceph/messanger.c has a good example of this.  When we do
- * this, we should look at executing 
- *     clear_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
- * in this callback.
- */
-static void callback_write_space(struct sock *sk){
-    client_t *client = (client_t*) sk->sk_user_data;
-
-    if (!test_bit(STATE_ACTIVE, &client->state))
-        return;
-
-    if (test_bit(WRITE, &client->state))
-        queue_client(client);
-}
-
-/** Callback for availability of data to read from a socket. */
-static void callback_data_ready(struct sock *sk, int bytes){
-    client_t *client = (client_t*) sk->sk_user_data;
-
-    if (!test_bit(STATE_ACTIVE, &client->state))
-        return;
-
-    if (sk->sk_state != TCP_CLOSE_WAIT)
-        queue_client(client);
-}
-
-/** Callback to indicate a state change on a socket, typically a disconnect. */
-static void callback_state_change(struct sock *sk){
-    client_t *client = (client_t*) sk->sk_user_data;
-
-    if (!test_bit(STATE_ACTIVE, &client->state))
-        return;
-
-    switch(sk->sk_state){
-        case TCP_CLOSE:
-        case TCP_CLOSE_WAIT:
-            if (test_and_set_bit(STATE_CLOSE, &client->state) == 0)
-                queue_client(client);
-            break;
-    }
-}
 
 static int listen_thread(void *data)
 {
@@ -238,11 +191,14 @@ static int listen_thread(void *data)
         }
 
         list_add(&client->list, &clients);
-        client->sock->sk->sk_user_data = client;
-        client->sock->sk->sk_data_ready = callback_data_ready;
-        client->sock->sk->sk_write_space = callback_write_space;
-        client->sock->sk->sk_state_change = callback_state_change;
-        queue_client(client);
+        client->task = kthread_create(client_thread, client, MODULE_NAME" client");
+        wake_up_process(client->task);
+
+        //queue_client(client);
+        //client->sock->sk->sk_user_data = client;
+        //client->sock->sk->sk_data_ready = callback_data_ready;
+        //client->sock->sk->sk_write_space = callback_write_space;
+        //client->sock->sk->sk_state_change = callback_state_change;
 
         printk(KERN_INFO MODULE_NAME": Accepted incoming connection.\n");
         /* TODO: output the IP of the connecting host, see __svc_print_addr */
@@ -278,6 +234,22 @@ static void client_work(struct work_struct *work){
         if (test_bit(STATE_CLOSE, &client->state) == 1)
             close_connection(client);
     }
+}
+static int client_thread(void *data)
+{
+    client_t *client = (client_t*)data;
+    memcached_protocol_event_t events;
+    int ret=0;
+    allow_signal(SIGTERM);
+
+    events = memcached_protocol_client_work(client->libmp);
+
+    if (events & MEMCACHED_PROTOCOL_ERROR_EVENT) {
+        ret = -1;
+    }
+    close_connection(client);
+    printk(KERN_INFO MODULE_NAME": client thread for %p stopped.", client);
+    return ret;
 }
 
 /** Open an listening socket */
@@ -402,7 +374,8 @@ void __exit kmemcached_exit(void)
 
     while (!list_empty(&clients)) {
         client_t *client = container_of(clients.next, client_t, list);
-        close_connection(client);
+        send_sig(SIGTERM, client->task, 1);
+        kthread_stop(client->task);
     }
 
     destroy_workqueue(workqueue);
