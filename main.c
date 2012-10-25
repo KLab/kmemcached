@@ -25,7 +25,6 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/workqueue.h>
-#include <linux/smp_lock.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/netdevice.h>
@@ -38,6 +37,20 @@
 #include "libmp/protocol_handler.h"
 #include "libmp/common.h"
 #include "storage.h"
+
+#include <linux/kthread.h>
+#include <linux/sched.h>
+
+//// Usage of kthread.
+// struct task_struct *listen_task;
+// listen_task = kthread_create(listen_thread, NULL, "listen thread");
+// if (IS_ERR(listen_task)) {
+//     error handling.
+// }
+// wake_up_process(kthread_create);
+// kthread_stop(listen_task);
+
+static struct task_struct *listen_task;
 
 /** The port we listen on.
  *
@@ -110,14 +123,13 @@ typedef struct client_t{
  */
 static LIST_HEAD(clients);
 
-static void listen_work(struct work_struct *work);
+static int listen_thread(void*);
+static void close_listen_socket(void);
 static void client_work(struct work_struct *work);
 static void close_connection(client_t *client);
 
 /** Workqueue for working on connections or the listening socket*/
 struct workqueue_struct *workqueue;
-/** Work for processing an incoming connection */
-DECLARE_WORK(listen_job,listen_work);
 
 /** Listening Socket
  *
@@ -133,14 +145,6 @@ struct memcached_protocol_st *protocol_handle;
 /** Equeue a client on the workqueue */
 static void queue_client(client_t *client){
     queue_work(workqueue, &(client->work));
-}
-
-/** Callback for new data on a listening socket */
-static void callback_listen(struct sock *sk, int bytes){
-    if (sk->sk_state != TCP_LISTEN)
-        return;
-
-    queue_work(workqueue, &listen_job);
 }
 
 /** Callback for availability of write space on a socket. 
@@ -188,18 +192,25 @@ static void callback_state_change(struct sock *sk){
     }
 }
 
-/** Work to handle an incoming connection on a listening socket */
-static void listen_work(struct work_struct *work){
-    (void)work;
+static int listen_thread(void *data)
+{
+    int ret = 0;
+    (void)data;
 
-    while (1){
+    printk(KERN_INFO MODULE_NAME": listen_thread started.\n");
+    allow_signal(SIGTERM);
+
+    while (!kthread_should_stop()) {
         int err = 0;
         client_t *client = NULL;
         struct socket *new_sock = NULL;
 
-        if ((err = kernel_accept(listen_socket, &new_sock, O_NONBLOCK)) < 0){
-            if (err != -EAGAIN)
-                printk(KERN_INFO MODULE_NAME": Could not accept incoming connection, error = %d\n",-err);
+        if ((err = kernel_accept(listen_socket, &new_sock, 0)) < 0){
+            if (signal_pending(current)) {
+                break;
+            }
+            printk(KERN_INFO MODULE_NAME": kernel_accept returns %d.\n", -err);
+            ret = err;
             break;
         } 
 
@@ -207,7 +218,8 @@ static void listen_work(struct work_struct *work){
             printk(KERN_INFO MODULE_NAME": Unable to allocate space for new client_t.\n");
             kernel_sock_shutdown(new_sock, SHUT_RDWR);
             sock_release(new_sock);
-            break;
+            ret = 0;
+            continue;
         }
 
         client->sock = new_sock;
@@ -222,28 +234,21 @@ static void listen_work(struct work_struct *work){
             printk(KERN_INFO MODULE_NAME": Could not allocate memory for memcached_protocol_client_st.");
             sock_release(client->sock);
             kfree(client);
-            break;
+            continue;
         }
 
         list_add(&client->list, &clients);
-
         client->sock->sk->sk_user_data = client;
         client->sock->sk->sk_data_ready = callback_data_ready;
         client->sock->sk->sk_write_space = callback_write_space;
         client->sock->sk->sk_state_change = callback_state_change;
-
-        /* TODO: Other things we should really do (see kernel_sock_ioctl)
-         *   * Set SO_SNDBUF and SO_RCVBUF, if we don't supply our own
-         *     look at net/sunrpc/svnsock.c:svn_sock_setbufsize for this
-         *   * Disable Nagle algorithm (sk->nonagle |= TCP_NAGLE_OFF
-         *   * Other socket magic?
-         */
-
         queue_client(client);
 
         printk(KERN_INFO MODULE_NAME": Accepted incoming connection.\n");
         /* TODO: output the IP of the connecting host, see __svc_print_addr */
     }
+    close_listen_socket();
+    return ret;
 }
 
 /** Work on a client connection */
@@ -303,8 +308,6 @@ static int open_listen_socket(void){
         return -2;
     }
 
-    listen_socket->sk->sk_data_ready = callback_listen;
-
     printk(KERN_INFO MODULE_NAME": Started, listening on port %d.\n", DEFAULT_PORT);
     return 0;
 }
@@ -316,6 +319,7 @@ static int open_listen_socket(void){
  * again after unloading the module have resulted in errors.
  */
 static void close_listen_socket(void){
+    printk(KERN_INFO MODULE_NAME": closing listen socket.\n");
     kernel_sock_shutdown(listen_socket, SHUT_RDWR);
     sock_release(listen_socket);
     listen_socket = NULL;
@@ -348,6 +352,13 @@ int __init kmemcached_init(void)
         if (ret == -2) close_listen_socket();
         return -ENXIO; // FIXME use better error code
     }
+    listen_task = kthread_create(listen_thread, NULL, MODULE_NAME " listen");
+    if (IS_ERR(listen_task)) {
+        long ret = PTR_ERR(listen_task);
+        close_listen_socket();
+        listen_task = NULL;
+        return ret;
+    }
 
     /* setup protocol library */
     if ((protocol_handle = memcached_protocol_create_instance()) == NULL){
@@ -370,6 +381,7 @@ int __init kmemcached_init(void)
     workqueue = create_freezeable_workqueue(MODULE_NAME);
 #endif
 
+    wake_up_process(listen_task);
     return 0;
 }
 
@@ -380,8 +392,10 @@ int __init kmemcached_init(void)
  * buffers.  Likely, this involves flushing each client off the workqueue
  * individually as we close their connections.
  */
-void __exit kmemcached_exit(void){
-    close_listen_socket();
+void __exit kmemcached_exit(void)
+{
+    send_sig(SIGTERM, listen_task, 1);
+    kthread_stop(listen_task);
 
     // FIXME do this client-by-client, see above
     flush_workqueue(workqueue);
