@@ -248,7 +248,7 @@ static int client_thread(void *data)
         ret = -1;
     }
     close_connection(client);
-    printk(KERN_INFO MODULE_NAME": client thread for %p stopped.", client);
+    printk(KERN_INFO MODULE_NAME": client thread for %p stopped.\n", client);
     return ret;
 }
 
