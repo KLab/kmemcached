@@ -128,7 +128,6 @@ static LIST_HEAD(clients);
 static int listen_thread(void*);
 static int client_thread(void*);
 static void close_listen_socket(void);
-static void client_work(struct work_struct *work);
 static void close_connection(client_t *client);
 
 /** Workqueue for working on connections or the listening socket*/
@@ -177,7 +176,6 @@ static int listen_thread(void *data)
 
         client->sock = new_sock;
         client->libmp = NULL;
-        INIT_WORK(&client->work, client_work);
         INIT_LIST_HEAD(&client->list);
         client->state = 0;
         set_bit(STATE_ACTIVE, &client->state);
@@ -194,12 +192,6 @@ static int listen_thread(void *data)
         client->task = kthread_create(client_thread, client, MODULE_NAME" client");
         wake_up_process(client->task);
 
-        //queue_client(client);
-        //client->sock->sk->sk_user_data = client;
-        //client->sock->sk->sk_data_ready = callback_data_ready;
-        //client->sock->sk->sk_write_space = callback_write_space;
-        //client->sock->sk->sk_state_change = callback_state_change;
-
         printk(KERN_INFO MODULE_NAME": Accepted incoming connection.\n");
         /* TODO: output the IP of the connecting host, see __svc_print_addr */
     }
@@ -207,34 +199,6 @@ static int listen_thread(void *data)
     return ret;
 }
 
-/** Work on a client connection */
-static void client_work(struct work_struct *work){
-    memcached_protocol_event_t events;
-    client_t *client = container_of(work, client_t, work);
-
-    if (!client->sock) // FIXME: when would this be true? error handleing?
-        return;  
-
-    /* If we are working on a non-active client, something went very wrong */
-    BUG_ON(!test_bit(STATE_ACTIVE, &client->state));
-
-    /* Do some work! */
-    events = memcached_protocol_client_work(client->libmp);
-
-    /* The goal here is for the buffers to be emptied before we shutdown the
-     * socket */
-
-    if (events & MEMCACHED_PROTOCOL_ERROR_EVENT)
-        set_bit(STATE_CLOSE, &client->state);
-
-    if (events & MEMCACHED_PROTOCOL_WRITE_EVENT){
-        set_bit(STATE_WRITING, &client->state);
-    } else {
-        clear_bit(STATE_WRITING, &client->state);
-        if (test_bit(STATE_CLOSE, &client->state) == 1)
-            close_connection(client);
-    }
-}
 static int client_thread(void *data)
 {
     client_t *client = (client_t*)data;
