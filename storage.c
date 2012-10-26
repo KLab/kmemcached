@@ -26,21 +26,7 @@
 
 /* FIXME: how many locks should we really be using? is it actually a function of
  * the number of processors and not the size of the hashtable? */
-#ifdef CONFIG_LOCKDEP
-# define HASH_LOCK_SZ	256
-#else
-# if NR_CPUS >= 32
-#  define HASH_LOCK_SZ	((uint32_t)1<<(hashpower-5))
-# elif NR_CPUS >= 16
-#  define HASH_LOCK_SZ	((uint32_t)1<<(hashpower-6))
-# elif NR_CPUS >= 8
-#  define HASH_LOCK_SZ	((uint32_t)1<<(hashpower-7))
-# elif NR_CPUS >= 4
-#  define HASH_LOCK_SZ	((uint32_t)1<<(hashpower-8))
-# else
-#  define HASH_LOCK_SZ	((uint32_t)1<<(hashpower-9))
-# endif
-#endif
+# define HASH_LOCK_SZ	128
 
 static spinlock_t *hash_locks;
 /* FIXME: should we be using something more random here? */
