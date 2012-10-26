@@ -94,9 +94,6 @@ static struct task_struct *listen_task;
  */
 #define STATE_CLOSE 3
 
-/** Our implementation of the memcached protocol callbacks */
-extern memcached_binary_protocol_callback_st interface_impl;
-
 /** Client data structure. */
 typedef struct client_t{
     /** Pointer to socket for this client's connection. */
@@ -132,9 +129,6 @@ static void close_connection(client_t *client);
  * sockets.
  */
 struct socket *listen_socket;
-
-/** libmemcachedprotocol handle */
-struct memcached_protocol_st *protocol_handle;
 
 static int listen_thread(void *data)
 {
@@ -172,7 +166,7 @@ static int listen_thread(void *data)
         client->state = 0;
         set_bit(STATE_ACTIVE, &client->state);
 
-        client->libmp = memcached_protocol_create_client(protocol_handle, client->sock);
+        client->libmp = memcached_protocol_create_client(client->sock);
         if (client->libmp == NULL){
             printk(KERN_INFO MODULE_NAME": Could not allocate memory for memcached_protocol_client_st.");
             sock_release(client->sock);
@@ -287,14 +281,6 @@ int __init kmemcached_init(void)
         return ret;
     }
 
-    /* setup protocol library */
-    if ((protocol_handle = memcached_protocol_create_instance()) == NULL){
-        printk(KERN_INFO MODULE_NAME": unable to allocate protocol handle\n");
-        return -ENOMEM;
-    }
-    memcached_binary_protocol_set_callbacks(protocol_handle,&interface_impl);
-    memcached_binary_protocol_set_pedantic(protocol_handle, false);
-
     if (initialize_storage() == false){
         printk(KERN_INFO MODULE_NAME": unable to initialize storage engine\n");
         return -ENOMEM;
@@ -324,11 +310,6 @@ void __exit kmemcached_exit(void)
     }
 
     shutdown_storage();
-
-    if (protocol_handle != NULL){
-        memcached_protocol_destroy_instance(protocol_handle);
-        protocol_handle = NULL;
-    }
 
     if (listen_socket != NULL) {
         sock_release(listen_socket);

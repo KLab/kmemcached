@@ -12,6 +12,8 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/delay.h>
+#include <net/sock.h>
+#include <net/tcp_states.h>
 #include <asm-generic/errno.h>
 
 /*
@@ -41,9 +43,6 @@ static ssize_t default_recv(const void *cookie,
   int size = 0;
 
   (void)cookie;
-
-  /* if there is no backing sock... */
-  if (sock->sk==NULL) return 0;
 
   kv.iov_base = buf;
   kv.iov_len = len;
@@ -82,23 +81,24 @@ static ssize_t default_send(const void *cookie,
 
   (void)cookie;
 
-  /* if there is no backing sock... 
-   * TODO: when would this be the case? */
-  if (sock->sk==NULL)
-      return 0;
-
-  /* Construct our scatter/gather list */
   kv.iov_base = (void*)buf;
   kv.iov_len = len;
 
-  msg.msg_flags = MSG_WAITALL;
+  msg.msg_flags = 0;
   msg.msg_name = NULL;
   msg.msg_namelen  = 0;
   msg.msg_control = NULL;
   msg.msg_controllen = 0;
 
-  /* TODO: what does this do? */
-  // http://mail.nl.linux.org/kernelnewbies/2005-12/msg00282.html
+  if (sock->state != SS_CONNECTED) {
+      return -1;
+  }
+  switch (sock->sk->sk_state) {
+  case TCP_CLOSE:
+  case TCP_CLOSE_WAIT:
+      return -1;
+  }
+
   size = kernel_sendmsg(sock, &msg, &kv, 1, len);
   return size;
 }
@@ -118,10 +118,10 @@ static bool drain_output(struct memcached_protocol_client_st *client)
   /* Do we have pending data to send? */
   while (client->output != NULL)
   {
-    len= client->root->send(client,
-                            client->sock,
-                            client->output->data + client->output->offset,
-                            client->output->nbytes - client->output->offset);
+    len= default_send(client,
+                      client->sock,
+                      client->output->data + client->output->offset,
+                      client->output->nbytes - client->output->offset);
 
     if (len < 0)
     {
@@ -315,21 +315,30 @@ void memcached_protocol_destroy_instance(struct memcached_protocol_st *instance)
   kfree(instance);
 }
 
-struct memcached_protocol_client_st *memcached_protocol_create_client(struct memcached_protocol_st *instance, memcached_socket_t sock)
+/** Our implementation of the memcached protocol callbacks */
+extern memcached_binary_protocol_callback_st interface_impl;
+
+struct memcached_protocol_client_st *memcached_protocol_create_client(memcached_socket_t sock)
 {
   struct memcached_protocol_client_st *ret= kcalloc(1, sizeof(*ret), GFP_KERNEL);
   if (ret != NULL)
   {
-    ret->root= instance;
+    ret->root = memcached_protocol_create_instance();
+    if (ret->root == NULL) {
+      kfree(ret);
+      return NULL;
+    }
+    memcached_binary_protocol_set_callbacks(ret->root, &interface_impl);
+    memcached_binary_protocol_set_pedantic(ret->root, false);
     ret->sock= sock;
     ret->work= determine_protocol;
   }
-
   return ret;
 }
 
 void memcached_protocol_client_destroy(struct memcached_protocol_client_st *client)
 {
+  kfree(client->root);
   kfree(client);
 }
 
@@ -339,10 +348,10 @@ memcached_protocol_event_t memcached_protocol_client_work(struct memcached_proto
         void *endptr;
         memcached_protocol_event_t events;
 
-        ssize_t len= client->root->recv(client,
-                                        client->sock,
-                                        client->root->input_buffer + client->input_buffer_offset,
-                                        client->root->input_buffer_size - client->input_buffer_offset);
+        ssize_t len = default_recv(client,
+                                   client->sock,
+                                   client->root->input_buffer + client->input_buffer_offset,
+                                   client->root->input_buffer_size - client->input_buffer_offset);
         if (len == 0) return 0;
         if (len <  0) return MEMCACHED_PROTOCOL_ERROR_EVENT;
 
