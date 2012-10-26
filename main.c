@@ -24,7 +24,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/workqueue.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/netdevice.h>
@@ -106,10 +105,6 @@ typedef struct client_t{
     /** Pointer to memcached protocol struct for this client. */
     struct memcached_protocol_client_st *libmp;
     
-    /** The work object associated with this client.  This is added to the
-     * workqueue when there is work to be done by this client. */
-    struct work_struct work;
-
     struct task_struct *task;
 
     /** For clients list. */
@@ -129,9 +124,6 @@ static int listen_thread(void*);
 static int client_thread(void*);
 static void close_listen_socket(void);
 static void close_connection(client_t *client);
-
-/** Workqueue for working on connections or the listening socket*/
-struct workqueue_struct *workqueue;
 
 /** Listening Socket
  *
@@ -274,7 +266,6 @@ static void close_connection(client_t *client){
 
     memcached_protocol_client_destroy(client->libmp);
     list_del(&client->list);
-    cancel_work_sync(&client->work);
     kfree(client);  
 }
 
@@ -310,13 +301,6 @@ int __init kmemcached_init(void)
         // FIXME leak in error condition
     }
 
-    /* start kernel thread */
-#ifdef alloc_workqueue
-    workqueue = alloc_workqueue(MODULE_NAME, WQ_NON_REENTRANT | WQ_FREEZEABLE, 0);
-#else
-    workqueue = create_freezeable_workqueue(MODULE_NAME);
-#endif
-
     wake_up_process(listen_task);
     return 0;
 }
@@ -333,16 +317,11 @@ void __exit kmemcached_exit(void)
     send_sig(SIGTERM, listen_task, 1);
     kthread_stop(listen_task);
 
-    // FIXME do this client-by-client, see above
-    flush_workqueue(workqueue);
-
     while (!list_empty(&clients)) {
         client_t *client = container_of(clients.next, client_t, list);
         send_sig(SIGTERM, client->task, 1);
         kthread_stop(client->task);
     }
-
-    destroy_workqueue(workqueue);
 
     shutdown_storage();
 
